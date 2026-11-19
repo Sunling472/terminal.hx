@@ -8,6 +8,8 @@ Two backends:
   against [libghostty-vt](https://lib.ghostty.org/vt/) owns a real pty and the
   VT state, and streams the visible grid to a Steel component.
   Full interactivity: fish/zsh/bash, vim, htop, curses apps, resize, Ctrl-C.
+  Colors: the helper resolves SGR and palette colors to RGB and sends style
+  runs; default-styled text uses the Helix theme (`ui.text`).
 * **pipe** (fallback, pure Steel): piped stdio plus a local line editor.
   No tty, no full-screen apps, but zero native dependencies.
 

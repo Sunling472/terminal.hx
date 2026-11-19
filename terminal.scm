@@ -8,6 +8,8 @@
 ;;     terminal queries) and streams the visible grid to this plugin.
 ;;       => fish/zsh/bash are fully interactive, vim/htop/curses work,
 ;;          resize and Ctrl-C are handled through the pty.
+;;     Colors: SGR/palette is resolved to RGB by the helper and sent as style
+;;     runs; default-styled text follows the hx theme.
 ;;     Keys are forwarded as-is; Ctrl-4 (what terminals send for Ctrl-\\)
 ;;     closes the popup, Esc is passed through to the child.
 ;;
@@ -105,6 +107,9 @@
 (define *term-gg-cursor?* #f)
 (define *term-gg-alt?* #f)
 (define *term-gg-size* #f)      ; last (cols . rows) sent to the helper
+;; style table: id -> (id fgR fgG fgB bgR bgG bgB attrs underline)
+(define *term-gg-style-defs* (hash))
+(define *term-gg-style-cache* (hash))
 
 ;; ---------------------------------------------------------------------------
 ;; configuration
@@ -298,6 +303,8 @@
   (set! *term-gg-pending* '())
   (set! *term-gg-cursor?* #f)
   (set! *term-gg-size* #f)
+  (set! *term-gg-style-defs* (hash))
+  (set! *term-gg-style-cache* (hash))
 
   (define cwd (with-handler (lambda (_) "") (helix-find-workspace)))
   (set! *term-cwd* cwd)
@@ -404,9 +411,75 @@
       [(char=? (string-ref s i) #\space) i]
       [else (loop (+ i 1))])))
 
-;; hx-term line protocol: F header / R row / E end / X exit
+(define (term-char-index s ch)
+  (let loop ([i 0])
+    (cond
+      [(>= i (string-length s)) #f]
+      [(char=? (string-ref s i) ch) i]
+      [else (loop (+ i 1))])))
+
+;; a run looks like "<style-id>\x02<text>"
+(define (term-parse-run piece)
+  (define i (term-char-index piece (integer->char 2)))
+  (if i
+      (let ([id (string->number (substring piece 0 i))])
+        (cons (if (number? id) id 0)
+              (substring piece (+ i 1) (string-length piece))))
+      (cons 0 piece)))
+
+(define (term-bit? n k)
+  (not (= 0 (bitwise-and n (expt 2 k)))))
+
+(define (term-build-style def)
+  (define st (theme-scope-ref "ui.text"))
+  (define fg-r (list-ref def 1))
+  (define fg-g (list-ref def 2))
+  (define fg-b (list-ref def 3))
+  (define bg-r (list-ref def 4))
+  (define bg-g (list-ref def 5))
+  (define bg-b (list-ref def 6))
+  (define attrs (list-ref def 7))
+  (define ul (list-ref def 8))
+  (when (>= fg-r 0) (set! st (style-fg st (Color/rgb fg-r fg-g fg-b))))
+  (when (>= bg-r 0) (set! st (style-bg st (Color/rgb bg-r bg-g bg-b))))
+  (when (term-bit? attrs 0) (set! st (style-with-bold st)))
+  (when (term-bit? attrs 1) (set! st (style-with-italics st)))
+  (when (term-bit? attrs 2) (set! st (style-with-dim st)))
+  (when (term-bit? attrs 3) (set! st (style-with-slow-blink st)))
+  (when (term-bit? attrs 4) (set! st (style-with-reversed st)))
+  (when (term-bit? attrs 5) (set! st (style-with-hidden st)))
+  (when (term-bit? attrs 6) (set! st (style-with-crossed-out st)))
+  (cond
+    [(= ul 1) (set! st (style-underline-style st Underline/Line))]
+    [(= ul 2) (set! st (style-underline-style st Underline/DoubleLine))]
+    [(= ul 3) (set! st (style-underline-style st Underline/Curl))]
+    [(= ul 4) (set! st (style-underline-style st Underline/Dotted))]
+    [(= ul 5) (set! st (style-underline-style st Underline/Dashed))]
+    [else #f])
+  st)
+
+(define (term-style-for id)
+  (cond
+    [(equal? id 0) (theme-scope-ref "ui.text")]
+    [(hash-contains? *term-gg-style-cache* id)
+     (hash-ref *term-gg-style-cache* id)]
+    [else
+     (define def (hash-ref *term-gg-style-defs* id))
+     (define st (if (list? def) (term-build-style def) (theme-scope-ref "ui.text")))
+     (set! *term-gg-style-cache* (hash-insert *term-gg-style-cache* id st))
+     st]))
+
+;; hx-term line protocol: T style / F header / R row / E end / X exit
 (define (term-gg-handle-line! line)
   (cond
+    [(term-starts-with? line "T ")
+     (define parts (split-many line " "))
+     (when (>= (length parts) 10)
+       (define nums (filter number? (map string->number (cdr parts))))
+       (when (>= (length nums) 9)
+         (set! *term-gg-style-defs*
+               (hash-insert *term-gg-style-defs* (list-ref nums 0) nums))
+         (set! *term-gg-style-cache* (hash))))]
     [(term-starts-with? line "F ")
      (define parts (split-many line " "))
      (when (>= (length parts) 7)
@@ -420,9 +493,12 @@
     [(term-starts-with? line "R ")
      (define sp (term-space-index line 2))
      (when sp
-       (set! *term-gg-pending*
-             (cons (substring line (+ sp 1) (string-length line))
-                   *term-gg-pending*)))]
+       (define rest (substring line (+ sp 1) (string-length line)))
+       (define pieces
+         (filter (lambda (p) (> (string-length p) 0))
+                 (split-many rest (string (integer->char 1)))))
+       (define runs (map term-parse-run pieces))
+       (set! *term-gg-pending* (cons runs *term-gg-pending*)))]
     [(equal? line "E")
      (set! *term-gg-rows* (reverse *term-gg-pending*))
      (set! *term-gg-pending* '())
@@ -643,10 +719,23 @@
 
   (let loop ([lst *term-gg-rows*] [row 0])
     (unless (or (null? lst) (>= row out-h))
-      (frame-set-string! frame content-x (+ y 2 row)
-                         (term-truncate (car lst) content-w)
-                         text-style)
+      (term-draw-runs! frame content-x (+ y 2 row) (car lst) content-w)
       (loop (cdr lst) (+ row 1)))))
+
+;; paint one row made of (style-id . text) runs, clipped to width
+(define (term-draw-runs! frame x y runs width)
+  (let loop ([rs runs] [col 0])
+    (unless (or (null? rs) (>= col width))
+      (define run (car rs))
+      (define text (cdr run))
+      (define avail (- width col))
+      (define shown (if (> (string-length text) avail)
+                        (substring text 0 avail)
+                        text))
+      (unless (= (string-length shown) 0)
+        (frame-set-string! frame (+ x col) y shown
+                           (term-style-for (car run))))
+      (loop (cdr rs) (+ col (string-length text))))))
 
 ;; pipe backend: local buffer + local input line
 (define (term-draw-pipe! frame x y w h text-style dim-style)

@@ -86,6 +86,105 @@ static size_t encode_utf8(uint32_t cp, char *out) {
   return 4;
 }
 
+/* ---- styles ---------------------------------------------------------- */
+
+#define MAX_STYLES 4096
+
+typedef struct {
+  int fg_r, fg_g, fg_b;
+  int bg_r, bg_g, bg_b;
+  int attrs;
+  int underline;
+} StyleDef;
+
+static StyleDef style_defs[MAX_STYLES];
+static int style_count = 1; /* id 0 is the default style */
+static int style_sent = 1;
+static GhosttyColorRgb palette[256];
+static int have_palette = 0;
+
+static void init_styles(void) {
+  StyleDef *d = &style_defs[0];
+  d->fg_r = d->fg_g = d->fg_b = -1;
+  d->bg_r = d->bg_g = d->bg_b = -1;
+  d->attrs = 0;
+  d->underline = 0;
+  if (ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE, palette) ==
+      GHOSTTY_SUCCESS) {
+    have_palette = 1;
+  }
+}
+
+static int resolve_color(const GhosttyStyleColor *c, int *r, int *g, int *b) {
+  if (c->tag == GHOSTTY_STYLE_COLOR_RGB) {
+    *r = c->value.rgb.r;
+    *g = c->value.rgb.g;
+    *b = c->value.rgb.b;
+    return 1;
+  }
+  if (c->tag == GHOSTTY_STYLE_COLOR_PALETTE) {
+    GhosttyColorRgb p = {0, 0, 0};
+    if (have_palette) p = palette[c->value.palette];
+    *r = p.r;
+    *g = p.g;
+    *b = p.b;
+    return 1;
+  }
+  return 0;
+}
+
+static int same_def(const StyleDef *a, const StyleDef *b) {
+  return a->fg_r == b->fg_r && a->fg_g == b->fg_g && a->fg_b == b->fg_b &&
+         a->bg_r == b->bg_r && a->bg_g == b->bg_g && a->bg_b == b->bg_b &&
+         a->attrs == b->attrs && a->underline == b->underline;
+}
+
+static int def_id(const StyleDef *d) {
+  if (d->fg_r < 0 && d->bg_r < 0 && d->attrs == 0 && d->underline == 0) return 0;
+  for (int i = 1; i < style_count; i++) {
+    if (same_def(&style_defs[i], d)) return i;
+  }
+  if (style_count >= MAX_STYLES) return 0;
+  style_defs[style_count] = *d;
+  return style_count++;
+}
+
+/* Resolve the style of one cell into our style table id. Called once per run
+ * of equal style ids, not per cell. */
+static int style_id_at(const GhosttyGridRef *ref, uint16_t sid) {
+  if (sid == 0) return 0;
+
+  GhosttyStyle st;
+  memset(&st, 0, sizeof(st));
+  st.size = sizeof(st);
+  if (ghostty_grid_ref_style(ref, &st) != GHOSTTY_SUCCESS) return 0;
+
+  StyleDef d;
+  d.fg_r = d.fg_g = d.fg_b = -1;
+  d.bg_r = d.bg_g = d.bg_b = -1;
+  d.attrs = 0;
+  d.underline = 0;
+
+  int r, g, b;
+  if (resolve_color(&st.fg_color, &r, &g, &b)) {
+    d.fg_r = r; d.fg_g = g; d.fg_b = b;
+  }
+  if (resolve_color(&st.bg_color, &r, &g, &b)) {
+    d.bg_r = r; d.bg_g = g; d.bg_b = b;
+  }
+  if (st.bold) d.attrs |= 1;
+  if (st.italic) d.attrs |= 2;
+  if (st.faint) d.attrs |= 4;
+  if (st.blink) d.attrs |= 8;
+  if (st.inverse) d.attrs |= 16;
+  if (st.invisible) d.attrs |= 32;
+  if (st.strikethrough) d.attrs |= 64;
+  if (st.overline) d.attrs |= 128;
+  d.underline = st.underline;
+
+  return def_id(&d);
+}
+
 /* ---- frame emission -------------------------------------------------- */
 
 struct outbuf {
@@ -136,14 +235,14 @@ static void emit_frame(void) {
                        &cursor_visible);
   ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &alt);
 
-  struct outbuf ob = {0};
-  ob_printf(&ob, "F %u %u %u %u %d %u\n", cols, rows, cx, cy,
-            cursor_visible ? 1 : 0,
-            alt == GHOSTTY_TERMINAL_SCREEN_ALTERNATE ? 1 : 0);
+  /* Rows are built first: running cells may register new styles, and their
+   * definitions must precede the frame in the output stream. */
+  struct outbuf rows_ob = {0};
 
   for (uint16_t y = 0; y < rows; y++) {
-    char row[MAX_COLS * 4 + 1];
-    size_t rlen = 0;
+    ob_printf(&rows_ob, "R %u ", y);
+
+    int cur_sid = -1;
     char utf8[4];
     uint32_t graphemes[16];
 
@@ -157,31 +256,59 @@ static void emit_frame(void) {
       memset(&ref, 0, sizeof(ref));
       ref.size = sizeof(ref);
 
+      int sid = 0;
       size_t gn = 0;
-      if (ghostty_terminal_grid_ref(term, pt, &ref) == GHOSTTY_SUCCESS &&
-          ghostty_grid_ref_graphemes(&ref, graphemes,
-                                     sizeof(graphemes) / sizeof(graphemes[0]),
-                                     &gn) == GHOSTTY_SUCCESS &&
-          gn > 0) {
-        size_t n = encode_utf8(graphemes[0], utf8);
-        if (rlen + n < sizeof(row)) {
-          memcpy(row + rlen, utf8, n);
-          rlen += n;
+      uint16_t style_id = 0;
+
+      if (ghostty_terminal_grid_ref(term, pt, &ref) == GHOSTTY_SUCCESS) {
+        GhosttyCell cell = 0;
+        if (ghostty_grid_ref_cell(&ref, &cell) == GHOSTTY_SUCCESS) {
+          ghostty_cell_get(cell, GHOSTTY_CELL_DATA_STYLE_ID, &style_id);
         }
+        if (style_id != (uint16_t)cur_sid) {
+          sid = style_id_at(&ref, style_id);
+          cur_sid = style_id;
+          char hdr[24];
+          int hn = snprintf(hdr, sizeof(hdr), "\x01%d\x02", sid);
+          if (hn > 0) {
+            ob_reserve(&rows_ob, (size_t)hn);
+            memcpy(rows_ob.data + rows_ob.len, hdr, (size_t)hn);
+            rows_ob.len += (size_t)hn;
+          }
+        }
+        ghostty_grid_ref_graphemes(&ref, graphemes,
+                                   sizeof(graphemes) / sizeof(graphemes[0]),
+                                   &gn);
+      }
+
+      if (gn > 0) {
+        size_t n = encode_utf8(graphemes[0], utf8);
+        ob_reserve(&rows_ob, n);
+        memcpy(rows_ob.data + rows_ob.len, utf8, n);
+        rows_ob.len += n;
       } else {
-        row[rlen++] = ' ';
+        ob_reserve(&rows_ob, 1);
+        rows_ob.data[rows_ob.len++] = ' ';
       }
     }
-
-    while (rlen > 0 && row[rlen - 1] == ' ') rlen--;
-    row[rlen] = '\0';
-
-    ob_printf(&ob, "R %u ", y);
-    ob_reserve(&ob, rlen + 2);
-    memcpy(ob.data + ob.len, row, rlen);
-    ob.len += rlen;
-    ob_puts(&ob, "\n");
+    ob_puts(&rows_ob, "\n");
   }
+
+  struct outbuf ob = {0};
+  for (int id = style_sent; id < style_count; id++) {
+    StyleDef *d = &style_defs[id];
+    ob_printf(&ob, "T %d %d %d %d %d %d %d %d %d\n", id, d->fg_r, d->fg_g,
+              d->fg_b, d->bg_r, d->bg_g, d->bg_b, d->attrs, d->underline);
+  }
+  style_sent = style_count;
+
+  ob_printf(&ob, "F %u %u %u %u %d %u\n", cols, rows, cx, cy,
+            cursor_visible ? 1 : 0,
+            alt == GHOSTTY_TERMINAL_SCREEN_ALTERNATE ? 1 : 0);
+  ob_reserve(&ob, rows_ob.len);
+  memcpy(ob.data + ob.len, rows_ob.data, rows_ob.len);
+  ob.len += rows_ob.len;
+  free(rows_ob.data);
   ob_puts(&ob, "E\n");
 
   size_t off = 0;
@@ -282,6 +409,7 @@ int main(int argc, char **argv) {
   }
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
                        (const void *)on_write_pty);
+  init_styles();
 
   struct winsize ws;
   memset(&ws, 0, sizeof(ws));
