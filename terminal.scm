@@ -2,7 +2,8 @@
 ;;
 ;; Two backends:
 ;;
-;;   ghostty (default): bin/hx-term, a small helper linked against libghostty-vt.
+;;   ghostty (default): bin/hx-term (built from hx-term.c in this package),
+;;     a small helper linked against libghostty-vt.
 ;;     It owns a real pty and the VT state (grid, alt screen, modes, answers to
 ;;     terminal queries) and streams the visible grid to this plugin.
 ;;       => fish/zsh/bash are fully interactive, vim/htop/curses work,
@@ -19,8 +20,8 @@
 ;; The backend is picked automatically: ghostty when bin/hx-term exists,
 ;; pipe otherwise.
 ;;
-;; Building the helper:
-;;   gcc -O2 -o bin/hx-term hx-term.c -lghostty-vt -lutil
+;; Building the helper (inside this package directory):
+;;   make            # gcc -O2 -o bin/hx-term hx-term.c -lghostty-vt -lutil
 ;;   (headers and the .so ship with the ghostty package; libghostty-vt 1.0+
 ;;    has a stable C ABI)
 ;;
@@ -153,7 +154,7 @@
   (define configured (hash-ref *term-config* 'helper))
   (if (and (string? configured) (> (string-length configured) 0))
       configured
-      (string-append (term-env-var "HOME") "/.config/helix/bin/hx-term")))
+      (string-append (term-env-var "HOME") "/.config/helix/terminal/bin/hx-term")))
 
 (define (term-backend)
   (define configured (hash-ref *term-config* 'backend))
