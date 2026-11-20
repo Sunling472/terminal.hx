@@ -11,7 +11,7 @@
 ;;     Colors: SGR/palette is resolved to RGB by the helper and sent as style
 ;;     runs; default-styled text follows the hx theme.
 ;;     Keys are forwarded as-is; Ctrl-4 (Ctrl-\\) hides the popup and keeps the
-;;     session running, Ctrl-D kills it. Esc goes to the child.
+;;     session running, Ctrl-Shift-D kills it, Esc and Ctrl-D go to the child.
 ;;
 ;;   pipe (fallback, pure steel, no pty): shell with piped stdio plus a local
 ;;     line editor and scrollback. No isatty, no full-screen apps, no job
@@ -875,8 +875,12 @@
           (or (char=? ch #\\) (char=? ch #\4)))
      (term-hide!)
      event-result/close]
-    ;; Ctrl-D kills the session
-    [(and (char? ch) (char=? ch #\d) (equal? mod key-modifier-ctrl))
+    ;; Ctrl-Shift-D kills the session (mod is a bitmask; plain Ctrl-D has no
+    ;; shift bit and is forwarded to the child below)
+    [(and (char? ch)
+          (or (char=? ch #\d) (char=? ch #\D))
+          (not (= 0 (bitwise-and mod key-modifier-ctrl)))
+          (not (= 0 (bitwise-and mod key-modifier-shift))))
      (term-destroy!)
      event-result/close]
     [else

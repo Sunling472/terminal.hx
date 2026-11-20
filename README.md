@@ -15,7 +15,7 @@ Two backends:
 
 A hidden session keeps running in the background (the helper pauses frame
 emission, so it costs nothing while hidden). Reopening restores the same
-shell, scrollback and working directory. Ctrl-D kills the session for real.
+shell, scrollback and working directory. Ctrl-Shift-D kills the session for real.
 
 ## Build the helper
 
@@ -54,15 +54,15 @@ package; 1.0+ has a stable C ABI).
 | Key | Action |
 |---|---|
 | Ctrl-4 (Ctrl-`) | hide the popup, keep the session running |
-| Ctrl-D | kill the session |
-| everything else | forwarded to the child (Esc included) |
+| Ctrl-Shift-D | kill the session (needs a terminal that reports the shift) |
+| everything else | forwarded to the child (Esc and Ctrl-D included) |
 
 ## Keys (pipe backend)
 
 | Key | Action |
 |---|---|
 | Esc | hide (the shell keeps running) |
-| Ctrl-D | kill |
+| Ctrl-Shift-D | kill |
 | Enter | submit line (restarts a dead shell) |
 | Up/Down | history |
 | PgUp/PgDn | scroll |
