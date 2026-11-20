@@ -925,15 +925,26 @@
      (define mod (key-event-modifier event))
      (cond
        [(not (char? ch)) event-result/consume]
+       [(and (or (char=? ch #\d) (char=? ch #\D))
+             (not (= 0 (bitwise-and mod key-modifier-ctrl)))
+             (not (= 0 (bitwise-and mod key-modifier-shift))))
+        (term-destroy!)
+        event-result/close]
        [(equal? mod key-modifier-ctrl)
         (cond
           [(char=? ch #\l) (term-clear-output!) event-result/consume]
           [(char=? ch #\u) (set! *term-input* "") (set! *term-caret* 0) event-result/consume]
           [(char=? ch #\c) (set! *term-input* "") (set! *term-caret* 0) event-result/consume]
-          [(char=? ch #\d) (term-destroy!) event-result/close]
+          [(char=? ch #\d) (term-close-stdin!) event-result/consume]
           [else event-result/consume])]
        [(equal? mod key-modifier-alt) (term-insert-char! ch) event-result/consume]
        [else (term-insert-char! ch) event-result/consume])]))
+
+(define (term-close-stdin!)
+  (when *term-stdin*
+    (with-handler (lambda (_) #f) (close-output-port *term-stdin*))
+    (set! *term-stdin* #f)
+    (set! *term-status* "stdin closed")))
 
 ;; hide: close the popup, keep the shell (and its pty) running
 (define (term-hide!)

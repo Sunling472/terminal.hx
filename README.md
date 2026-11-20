@@ -62,6 +62,7 @@ package; 1.0+ has a stable C ABI).
 | Key | Action |
 |---|---|
 | Esc | hide (the shell keeps running) |
+| Ctrl-D | close the shell's stdin |
 | Ctrl-Shift-D | kill |
 | Enter | submit line (restarts a dead shell) |
 | Up/Down | history |
