@@ -10,14 +10,14 @@
 ;;          resize and Ctrl-C are handled through the pty.
 ;;     Colors: SGR/palette is resolved to RGB by the helper and sent as style
 ;;     runs; default-styled text follows the hx theme.
-;;     Keys are forwarded as-is; Ctrl-4 (what terminals send for Ctrl-\\)
-;;     closes the popup, Esc is passed through to the child.
+;;     Keys are forwarded as-is; Ctrl-4 (Ctrl-\\) hides the popup and keeps the
+;;     session running, Ctrl-D kills it. Esc goes to the child.
 ;;
 ;;   pipe (fallback, pure steel, no pty): shell with piped stdio plus a local
 ;;     line editor and scrollback. No isatty, no full-screen apps, no job
-;;     control. Esc closes, Enter submits, Up/Down history, Tab inserts two
-;;     spaces, PgUp/PgDn scroll, Ctrl-L clears the output, Ctrl-U/Ctrl-C clear
-;;     the input line, Ctrl-D closes stdin.
+;;     control. Esc hides (the shell keeps running), Ctrl-D kills, Enter
+;;     submits, Up/Down history, Tab inserts two spaces, PgUp/PgDn scroll,
+;;     Ctrl-L clears the output, Ctrl-U/Ctrl-C clear the input line.
 ;;
 ;; The backend is picked automatically: ghostty when bin/hx-term exists,
 ;; pipe otherwise.
@@ -110,6 +110,8 @@
 ;; style table: id -> (id fgR fgG fgB bgR bgG bgB attrs underline)
 (define *term-gg-style-defs* (hash))
 (define *term-gg-style-cache* (hash))
+
+(define *term-timer?* #f)       ; a tick chain is scheduled
 
 ;; ---------------------------------------------------------------------------
 ;; configuration
@@ -505,7 +507,7 @@
      (set! *term-got-data?* #t)]
     [(term-starts-with? line "X ")
      (set! *term-exited?* #t)
-     (set! *term-status* "process exited -- Enter restarts, Ctrl-4 closes")]
+     (set! *term-status* "process exited -- Enter restarts, Ctrl-D kills")]
     [else
      (when (> (string-length line) 0)
        (set! *term-status* (string-append "hx-term: " line)))]))
@@ -522,7 +524,7 @@
          (unless *term-exited?*
            (unless *term-gg?* (term-flush-partial!))
            (set! *term-exited?* #t)
-           (set! *term-status* "process exited -- Enter restarts, Ctrl-4 closes"))]
+           (set! *term-status* "process exited -- Enter restarts, Ctrl-D kills"))]
         [(and (list? v) (equal? (car v) 'line))
          (term-gg-handle-line! (list-ref v 1))
          (loop)]
@@ -544,8 +546,11 @@
 
 (define (term-tick)
   (term-drain!)
-  (when *term-active?*
-    (enqueue-thread-local-callback-with-delay (term-next-delay) term-tick)))
+  ;; keep draining while the popup is hidden so a running session does not
+  ;; pile up frames in the channel; stop once it is killed/exited
+  (if (or *term-active?* (and *term-started?* (not *term-exited?*)))
+      (enqueue-thread-local-callback-with-delay (term-next-delay) term-tick)
+      (set! *term-timer?* #f)))
 
 ;; ---------------------------------------------------------------------------
 ;; input line editing
@@ -857,18 +862,22 @@
   (cond
     [*term-exited?*
      (cond
-       [(key-event-escape? event) (term-close!) event-result/close]
+       [(key-event-escape? event) (term-destroy!) event-result/close]
        [(key-event-enter? event)
         (term-kill!)
         (set! *term-started?* #f)
         (term-spawn!)
         event-result/consume]
        [else event-result/consume])]
-    ;; a terminal sends Ctrl-\ as Ctrl-4 (0x1c); either spelling closes the popup
+    ;; a terminal sends Ctrl-\ as Ctrl-4 (0x1c); either spelling hides the popup
     [(and (char? ch)
           (equal? mod key-modifier-ctrl)
           (or (char=? ch #\\) (char=? ch #\4)))
-     (term-close!)
+     (term-hide!)
+     event-result/close]
+    ;; Ctrl-D kills the session
+    [(and (char? ch) (char=? ch #\d) (equal? mod key-modifier-ctrl))
+     (term-destroy!)
      event-result/close]
     [else
      (define bytes (term-gg-key-bytes event))
@@ -890,7 +899,7 @@
 
 (define (term-pipe-handle-event event)
   (cond
-    [(key-event-escape? event) (term-close!) event-result/close]
+    [(key-event-escape? event) (term-hide!) event-result/close]
     [(key-event-enter? event) (term-enter!) event-result/consume]
     [(key-event-backspace? event) (term-delete-before!) event-result/consume]
     [(key-event-delete? event) (term-delete-at!) event-result/consume]
@@ -917,22 +926,29 @@
           [(char=? ch #\l) (term-clear-output!) event-result/consume]
           [(char=? ch #\u) (set! *term-input* "") (set! *term-caret* 0) event-result/consume]
           [(char=? ch #\c) (set! *term-input* "") (set! *term-caret* 0) event-result/consume]
-          [(char=? ch #\d) (term-close-stdin!) event-result/consume]
+          [(char=? ch #\d) (term-destroy!) event-result/close]
           [else event-result/consume])]
        [(equal? mod key-modifier-alt) (term-insert-char! ch) event-result/consume]
        [else (term-insert-char! ch) event-result/consume])]))
 
-(define (term-close-stdin!)
-  (when *term-stdin*
-    (with-handler (lambda (_) #f) (close-output-port *term-stdin*))
-    (set! *term-stdin* #f)
-    (set! *term-status* "stdin closed")))
+;; hide: close the popup, keep the shell (and its pty) running
+(define (term-hide!)
+  (set! *term-active?* #f)
+  (when *term-gg?* (term-send-line! "P 1")))
 
-(define (term-close!)
+;; destroy: kill the shell and forget the session
+(define (term-destroy!)
   (set! *term-active?* #f)
   (term-kill!)
   (set! *term-started?* #f)
-  (set! *term-exited?* #f))
+  (set! *term-exited?* #f)
+  (set! *term-gg-rows* '())
+  (set! *term-gg-pending* '())
+  (set! *term-gg-cursor?* #f)
+  (set! *term-gg-size* #f)
+  (set! *term-gg-style-defs* (hash))
+  (set! *term-gg-style-cache* (hash))
+  (term-clear-output!))
 
 (define (term-restart!)
   (when *term-started?*
@@ -1004,8 +1020,11 @@
     (set! *term-active?* #t)
     (set! *term-scroll* 0)
     (set! *term-parse* 'text)
+    (when *term-gg?* (term-send-line! "P 0"))
     (unless *term-started?* (set! *term-status* "starting..."))
     (set! *term-input* "")
     (set! *term-caret* 0)
     (push-component! (term-make-component))
-    (enqueue-thread-local-callback-with-delay (hash-ref *term-config* 'tick-fast) term-tick)))
+    (unless *term-timer?*
+      (set! *term-timer?* #t)
+      (enqueue-thread-local-callback-with-delay (hash-ref *term-config* 'tick-fast) term-tick))))

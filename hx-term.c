@@ -13,6 +13,7 @@
  *   stdin (from plugin), one command per line:
  *     K <byte> [<byte> ...]     bytes to write to the pty (0-255)
  *     S <cols> <rows>           resize
+ *     P <0|1>                   pause/resume frame emission (hidden popup)
  *     Q                         quit
  */
 
@@ -41,6 +42,7 @@ static GhosttyTerminal term = NULL;
 static int pty_fd = -1;
 static int child_pid = -1;
 static volatile int dirty = 1;
+static volatile int paused = 0; /* hidden: keep state, stop emitting frames */
 
 /* ---- pty replies (DA1, OSC 11, kitty keyboard, ...) ------------------- */
 
@@ -366,6 +368,12 @@ static void handle_line(char *line) {
       set_winsize((uint16_t)c, (uint16_t)r);
       dirty = 1;
     }
+  } else if (line[0] == 'P') {
+    int v = 0;
+    if (sscanf(line + 1, "%d", &v) == 1) {
+      paused = v ? 1 : 0;
+      if (!paused) dirty = 1; /* resume with a full frame */
+    }
   } else if (line[0] == 'Q') {
     if (child_pid > 0) kill(child_pid, SIGHUP);
     exit(0);
@@ -496,9 +504,13 @@ int main(int argc, char **argv) {
         }
         if (inlen == sizeof(inbuf)) inlen = 0; /* drop oversized */
       } else if (n == 0) {
+        /* the plugin went away (hx closed the pipe): don't leave an orphan
+         * shell behind, take it down with us */
         stdin_open = 0;
+        break;
       } else if (errno != EAGAIN && errno != EINTR) {
         stdin_open = 0;
+        break;
       }
     }
 
@@ -524,12 +536,13 @@ int main(int argc, char **argv) {
       break;
     }
 
-    if (dirty) {
+    if (dirty && !paused) {
       emit_frame();
       dirty = 0;
     }
   }
 
+  if (child_pid > 0) kill(child_pid, SIGHUP);
   ghostty_terminal_free(term);
   return 0;
 }

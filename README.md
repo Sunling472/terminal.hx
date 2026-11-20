@@ -13,6 +13,10 @@ Two backends:
 * **pipe** (fallback, pure Steel): piped stdio plus a local line editor.
   No tty, no full-screen apps, but zero native dependencies.
 
+A hidden session keeps running in the background (the helper pauses frame
+emission, so it costs nothing while hidden). Reopening restores the same
+shell, scrollback and working directory. Ctrl-D kills the session for real.
+
 ## Build the helper
 
 ```sh
@@ -49,14 +53,16 @@ package; 1.0+ has a stable C ABI).
 
 | Key | Action |
 |---|---|
-| Ctrl-4 | close the popup (terminals send this for Ctrl-`\`) |
+| Ctrl-4 (Ctrl-`) | hide the popup, keep the session running |
+| Ctrl-D | kill the session |
 | everything else | forwarded to the child (Esc included) |
 
 ## Keys (pipe backend)
 
 | Key | Action |
 |---|---|
-| Esc | close |
+| Esc | hide (the shell keeps running) |
+| Ctrl-D | kill |
 | Enter | submit line (restarts a dead shell) |
 | Up/Down | history |
 | PgUp/PgDn | scroll |
